@@ -4,6 +4,7 @@ import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { createFileDownloadToken, verifyFileDownloadToken } from '../utils/jwt';
 import { cipherToResponse } from './ciphers';
+import { LIMITS } from '../config/limits';
 
 // Format file size to human readable
 function formatSize(bytes: number): string {
@@ -86,7 +87,7 @@ export async function handleCreateAttachment(
 }
 
 // Maximum file size: 100MB
-const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const MAX_FILE_SIZE = LIMITS.attachment.maxFileSizeBytes;
 
 // POST /api/ciphers/{cipherId}/attachment/{attachmentId}
 // Upload attachment file content
@@ -211,7 +212,7 @@ export async function handlePublicDownloadAttachment(
   attachmentId: string
 ): Promise<Response> {
   const secret = (env.JWT_SECRET || '').trim();
-  if (!secret || secret.length < 32 || secret === DEFAULT_DEV_SECRET) {
+  if (!secret || secret.length < LIMITS.auth.jwtSecretMinLength || secret === DEFAULT_DEV_SECRET) {
     return errorResponse('Server configuration error', 500);
   }
 
@@ -259,7 +260,6 @@ export async function handlePublicDownloadAttachment(
       'Content-Type': 'application/octet-stream',
       'Content-Length': String(object.size),
       'Cache-Control': 'private, no-cache',
-      'Access-Control-Allow-Origin': '*',
     },
   });
 }

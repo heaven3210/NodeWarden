@@ -1,4 +1,5 @@
 import { User, Cipher, Folder, Attachment } from '../types';
+import { LIMITS } from '../config/limits';
 
 // D1-backed storage.
 // Contract:
@@ -8,13 +9,20 @@ import { User, Cipher, Folder, Attachment } from '../types';
 
 export class StorageService {
   private static attachmentTokenTableReady = false;
+  private static schemaVerified = false;
+  private static lastRefreshTokenCleanupAt = 0;
+  private static lastAttachmentTokenCleanupAt = 0;
+
+  private static readonly REFRESH_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.refreshTokenCleanupIntervalMs;
+  private static readonly ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.attachmentTokenCleanupIntervalMs;
+  private static readonly PERIODIC_CLEANUP_PROBABILITY = LIMITS.cleanup.cleanupProbability;
 
   constructor(private db: D1Database) {}
 
   /**
    * D1 .bind() throws on `undefined` values. This helper converts every
    * `undefined` in the argument list to `null` so we never hit that runtime
-   * error — especially important after the opaque-passthrough change where
+   * error - especially important after the opaque-passthrough change where
    * client-supplied JSON may omit fields we later reference as columns.
    */
   private safeBind(stmt: D1PreparedStatement, ...values: any[]): D1PreparedStatement {
@@ -32,133 +40,83 @@ export class StorageService {
     return `sha256:${digest}`;
   }
 
+  private shouldRunPeriodicCleanup(lastRunAt: number, intervalMs: number): boolean {
+    const now = Date.now();
+    if (now - lastRunAt < intervalMs) return false;
+    return Math.random() < StorageService.PERIODIC_CLEANUP_PROBABILITY;
+  }
+
+  private async maybeCleanupExpiredRefreshTokens(nowMs: number): Promise<void> {
+    if (!this.shouldRunPeriodicCleanup(StorageService.lastRefreshTokenCleanupAt, StorageService.REFRESH_TOKEN_CLEANUP_INTERVAL_MS)) {
+      return;
+    }
+
+    await this.db.prepare('DELETE FROM refresh_tokens WHERE expires_at < ?').bind(nowMs).run();
+    StorageService.lastRefreshTokenCleanupAt = nowMs;
+  }
+
   // --- Database initialization ---
-  // Idempotent auto-init for environments where D1 migrations have not been applied
-  // (e.g. one-click deploy). Mirrors the schema in migrations/0001_init.sql —
-  // keep both in sync when changing the schema.
-  
+  // One-click deploy requires zero manual migration steps.
+  // This method idempotently creates required schema objects on first request.
   async initializeDatabase(): Promise<void> {
-    // Check if database is already initialized by looking for the config table
-    try {
-      const result = await this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='config'")
-        .first<{ name: string }>();
-      
-      if (result?.name === 'config') {
-        // Database already initialized
-        return;
-      }
-    } catch (e) {
-      // If error occurs, assume database needs initialization
-      console.log('Initializing database...');
+    if (StorageService.schemaVerified) return;
+
+    const schemaStatements = [
+      'PRAGMA foreign_keys = ON',
+
+      'CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+
+      'CREATE TABLE IF NOT EXISTS users (' +
+      'id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT, master_password_hash TEXT NOT NULL, ' +
+      'key TEXT NOT NULL, private_key TEXT, public_key TEXT, kdf_type INTEGER NOT NULL, ' +
+      'kdf_iterations INTEGER NOT NULL, kdf_memory INTEGER, kdf_parallelism INTEGER, ' +
+      'security_stamp TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)',
+
+      'CREATE TABLE IF NOT EXISTS user_revisions (' +
+      'user_id TEXT PRIMARY KEY, revision_date TEXT NOT NULL, ' +
+      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+
+      'CREATE TABLE IF NOT EXISTS ciphers (' +
+      'id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type INTEGER NOT NULL, folder_id TEXT, name TEXT, notes TEXT, ' +
+      'favorite INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, reprompt INTEGER, key TEXT, ' +
+      'created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, ' +
+      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS idx_ciphers_user_updated ON ciphers(user_id, updated_at)',
+      'CREATE INDEX IF NOT EXISTS idx_ciphers_user_deleted ON ciphers(user_id, deleted_at)',
+
+      'CREATE TABLE IF NOT EXISTS folders (' +
+      'id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, ' +
+      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS idx_folders_user_updated ON folders(user_id, updated_at)',
+
+      'CREATE TABLE IF NOT EXISTS attachments (' +
+      'id TEXT PRIMARY KEY, cipher_id TEXT NOT NULL, file_name TEXT NOT NULL, size INTEGER NOT NULL, ' +
+      'size_name TEXT NOT NULL, key TEXT, ' +
+      'FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS idx_attachments_cipher ON attachments(cipher_id)',
+
+      'CREATE TABLE IF NOT EXISTS refresh_tokens (' +
+      'token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL, ' +
+      'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)',
+
+      'CREATE TABLE IF NOT EXISTS api_rate_limits (' +
+      'identifier TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL, ' +
+      'PRIMARY KEY (identifier, window_start))',
+      'CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start)',
+
+      'CREATE TABLE IF NOT EXISTS login_attempts_ip (' +
+      'ip TEXT PRIMARY KEY, attempts INTEGER NOT NULL, locked_until INTEGER, updated_at INTEGER NOT NULL)',
+
+      'CREATE TABLE IF NOT EXISTS used_attachment_download_tokens (' +
+      'jti TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)',
+    ];
+
+    for (const stmt of schemaStatements) {
+      await this.db.prepare(stmt).run();
     }
 
-    // Execute initialization SQL
-    const initSQL = `
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS config (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
-  name TEXT,
-  master_password_hash TEXT NOT NULL,
-  key TEXT NOT NULL,
-  private_key TEXT,
-  public_key TEXT,
-  kdf_type INTEGER NOT NULL,
-  kdf_iterations INTEGER NOT NULL,
-  kdf_memory INTEGER,
-  kdf_parallelism INTEGER,
-  security_stamp TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS user_revisions (
-  user_id TEXT PRIMARY KEY,
-  revision_date TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS ciphers (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  type INTEGER NOT NULL,
-  folder_id TEXT,
-  name TEXT,
-  notes TEXT,
-  favorite INTEGER NOT NULL DEFAULT 0,
-  data TEXT NOT NULL,
-  reprompt INTEGER,
-  key TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  deleted_at TEXT,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_ciphers_user_updated ON ciphers(user_id, updated_at);
-CREATE INDEX IF NOT EXISTS idx_ciphers_user_deleted ON ciphers(user_id, deleted_at);
-
-CREATE TABLE IF NOT EXISTS folders (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_folders_user_updated ON folders(user_id, updated_at);
-
-CREATE TABLE IF NOT EXISTS attachments (
-  id TEXT PRIMARY KEY,
-  cipher_id TEXT NOT NULL,
-  file_name TEXT NOT NULL,
-  size INTEGER NOT NULL,
-  size_name TEXT NOT NULL,
-  key TEXT,
-  FOREIGN KEY (cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_attachments_cipher ON attachments(cipher_id);
-
-CREATE TABLE IF NOT EXISTS refresh_tokens (
-  token TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  expires_at INTEGER NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
-
-CREATE TABLE IF NOT EXISTS login_attempts (
-  email TEXT PRIMARY KEY,
-  attempts INTEGER NOT NULL,
-  locked_until INTEGER,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS api_rate_limits (
-  identifier TEXT NOT NULL,
-  window_start INTEGER NOT NULL,
-  count INTEGER NOT NULL,
-  PRIMARY KEY (identifier, window_start)
-);
-CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
-    `.trim();
-
-    // Split by semicolon and execute each statement
-    const statements = initSQL.split(';').filter(s => s.trim().length > 0);
-    
-    for (const stmt of statements) {
-      if (stmt.trim()) {
-        await this.db.prepare(stmt).run();
-      }
-    }
-    
-    console.log('Database initialized successfully');
+    StorageService.schemaVerified = true;
   }
 
   // --- Config / setup ---
@@ -335,6 +293,21 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
     return (res.results || []).map(r => JSON.parse(r.data) as Cipher);
   }
 
+  async getCiphersPage(userId: string, includeDeleted: boolean, limit: number, offset: number): Promise<Cipher[]> {
+    const whereDeleted = includeDeleted ? '' : 'AND deleted_at IS NULL';
+    const res = await this.db
+      .prepare(
+        `SELECT data FROM ciphers
+         WHERE user_id = ?
+         ${whereDeleted}
+         ORDER BY updated_at DESC
+         LIMIT ? OFFSET ?`
+      )
+      .bind(userId, limit, offset)
+      .all<{ data: string }>();
+    return (res.results || []).map(r => JSON.parse(r.data) as Cipher);
+  }
+
   async getCiphersByIds(ids: string[], userId: string): Promise<Cipher[]> {
     if (ids.length === 0) return [];
     // D1 doesn't support binding arrays directly; build placeholders.
@@ -347,20 +320,25 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
   async bulkMoveCiphers(ids: string[], folderId: string | null, userId: string): Promise<void> {
     if (ids.length === 0) return;
     const now = new Date().toISOString();
+    const uniqueIds = Array.from(new Set(ids));
+    const patch = JSON.stringify({
+      folderId,
+      updatedAt: now,
+    });
+    const chunkSize = LIMITS.performance.bulkMoveChunkSize;
 
-    // D1 forbids raw BEGIN/COMMIT statements in this runtime.
-    // For this endpoint, we accept per-row updates and then bump revision once.
-    // Concurrency: each cipher write is an UPSERT on its PK, no shared index.
-    for (const id of ids) {
-      const row = await this.db
-        .prepare('SELECT data FROM ciphers WHERE id = ? AND user_id = ?')
-        .bind(id, userId)
-        .first<{ data: string }>();
-      if (!row?.data) continue;
-      const cipher = JSON.parse(row.data) as Cipher;
-      cipher.folderId = folderId;
-      cipher.updatedAt = now;
-      await this.saveCipher(cipher);
+    for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+      const chunk = uniqueIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(',');
+
+      await this.db
+        .prepare(
+          `UPDATE ciphers
+           SET folder_id = ?, updated_at = ?, data = json_patch(data, ?)
+           WHERE user_id = ? AND id IN (${placeholders})`
+        )
+        .bind(folderId, now, patch, userId, ...chunk)
+        .run();
     }
 
     await this.updateRevisionDate(userId);
@@ -418,6 +396,22 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
     const res = await this.db
       .prepare('SELECT id, user_id, name, created_at, updated_at FROM folders WHERE user_id = ? ORDER BY updated_at DESC')
       .bind(userId)
+      .all<any>();
+    return (res.results || []).map(r => ({
+      id: r.id,
+      userId: r.user_id,
+      name: r.name,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  async getFoldersPage(userId: string, limit: number, offset: number): Promise<Folder[]> {
+    const res = await this.db
+      .prepare(
+        'SELECT id, user_id, name, created_at, updated_at FROM folders WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+      )
+      .bind(userId, limit, offset)
       .all<any>();
     return (res.results || []).map(r => ({
       id: r.id,
@@ -531,7 +525,8 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
   // --- Refresh tokens ---
 
   async saveRefreshToken(token: string, userId: string, expiresAtMs?: number): Promise<void> {
-    const expiresAt = expiresAtMs ?? (Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const expiresAt = expiresAtMs ?? (Date.now() + LIMITS.auth.refreshTokenTtlMs);
+    await this.maybeCleanupExpiredRefreshTokens(Date.now());
     const tokenKey = await this.refreshTokenKey(token);
     await this.db.prepare(
       'INSERT INTO refresh_tokens(token, user_id, expires_at) VALUES(?, ?, ?) ' +
@@ -543,6 +538,7 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
 
   async getRefreshTokenUserId(token: string): Promise<string | null> {
     const now = Date.now();
+    await this.maybeCleanupExpiredRefreshTokens(now);
     const tokenKey = await this.refreshTokenKey(token);
 
     let row = await this.db.prepare('SELECT user_id, expires_at FROM refresh_tokens WHERE token = ?')
@@ -585,7 +581,17 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
     const row = await this.db.prepare('SELECT revision_date FROM user_revisions WHERE user_id = ?')
       .bind(userId)
       .first<{ revision_date: string }>();
-    return row?.revision_date || new Date().toISOString();
+    if (row?.revision_date) return row.revision_date;
+
+    const date = new Date().toISOString();
+    await this.db
+      .prepare(
+        'INSERT INTO user_revisions(user_id, revision_date) VALUES(?, ?) ' +
+        'ON CONFLICT(user_id) DO NOTHING'
+      )
+      .bind(userId, date)
+      .run();
+    return date;
   }
 
   async updateRevisionDate(userId: string): Promise<string> {
@@ -620,8 +626,15 @@ CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
     await this.ensureUsedAttachmentDownloadTokenTable();
 
     const nowMs = Date.now();
-    // Best-effort cleanup of expired entries.
-    await this.db.prepare('DELETE FROM used_attachment_download_tokens WHERE expires_at < ?').bind(nowMs).run();
+    if (
+      this.shouldRunPeriodicCleanup(
+        StorageService.lastAttachmentTokenCleanupAt,
+        StorageService.ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS
+      )
+    ) {
+      await this.db.prepare('DELETE FROM used_attachment_download_tokens WHERE expires_at < ?').bind(nowMs).run();
+      StorageService.lastAttachmentTokenCleanupAt = nowMs;
+    }
 
     const expiresAtMs = expUnixSeconds * 1000;
     const result = await this.db.prepare(

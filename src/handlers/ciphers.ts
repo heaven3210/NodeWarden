@@ -3,6 +3,7 @@ import { StorageService } from '../services/storage';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { deleteAllAttachmentsForCipher } from './attachments';
+import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 
 // Format attachments for API response
 export function formatAttachments(attachments: Attachment[]): any[] | null {
@@ -53,15 +54,28 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
 // GET /api/ciphers
 export async function handleGetCiphers(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const ciphers = await storage.getAllCiphers(userId);
-
-  // Filter out soft-deleted ciphers unless specifically requested
   const url = new URL(request.url);
   const includeDeleted = url.searchParams.get('deleted') === 'true';
-  
-  const filteredCiphers = includeDeleted 
-    ? ciphers 
-    : ciphers.filter(c => !c.deletedAt);
+  const pagination = parsePagination(url);
+
+  let filteredCiphers: Cipher[];
+  let continuationToken: string | null = null;
+  if (pagination) {
+    const pageRows = await storage.getCiphersPage(
+      userId,
+      includeDeleted,
+      pagination.limit + 1,
+      pagination.offset
+    );
+    const hasNext = pageRows.length > pagination.limit;
+    filteredCiphers = hasNext ? pageRows.slice(0, pagination.limit) : pageRows;
+    continuationToken = hasNext ? encodeContinuationToken(pagination.offset + filteredCiphers.length) : null;
+  } else {
+    const ciphers = await storage.getAllCiphers(userId);
+    filteredCiphers = includeDeleted
+      ? ciphers
+      : ciphers.filter(c => !c.deletedAt);
+  }
 
   const attachmentsByCipher = await storage.getAttachmentsByCipherIds(filteredCiphers.map(c => c.id));
 
@@ -75,7 +89,7 @@ export async function handleGetCiphers(request: Request, env: Env, userId: strin
   return jsonResponse({
     data: cipherResponses,
     object: 'list',
-    continuationToken: null,
+    continuationToken: continuationToken,
   });
 }
 

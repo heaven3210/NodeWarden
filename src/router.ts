@@ -2,6 +2,7 @@ import { Env, DEFAULT_DEV_SECRET } from './types';
 import { AuthService } from './services/auth';
 import { RateLimitService, getClientIdentifier } from './services/ratelimit';
 import { handleCors, errorResponse, jsonResponse } from './utils/response';
+import { LIMITS } from './config/limits';
 
 // Identity handlers
 import { handleToken, handlePrelogin } from './handlers/identity';
@@ -78,7 +79,7 @@ function handleNwFavicon(): Response {
     status: 200,
     headers: {
       'Content-Type': 'image/svg+xml; charset=utf-8',
-      'Cache-Control': 'public, max-age=604800',
+      'Cache-Control': `public, max-age=${LIMITS.cache.iconTtlSeconds}`,
     },
   });
 }
@@ -87,8 +88,11 @@ function isValidIconHostname(hostname: string): boolean {
   if (!hostname) return false;
   if (hostname.length > 253) return false;
 
-  const normalized = hostname.toLowerCase();
-  const domainPattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  // Slightly relaxed domain validation:
+  // - keep strict label boundaries (no leading/trailing hyphen)
+  // - allow punycode TLD (e.g. xn--...)
+  const domainPattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/;
   const ipv4Pattern = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 
   if (domainPattern.test(normalized)) return true;
@@ -124,7 +128,7 @@ async function handleGetIcon(request: Request, env: Env, hostname: string): Prom
       redirect: 'follow',
       cf: {
         cacheEverything: true,
-        cacheTtl: 604800,
+        cacheTtl: LIMITS.cache.iconTtlSeconds,
       },
     });
 
@@ -134,8 +138,7 @@ async function handleGetIcon(request: Request, env: Env, hostname: string): Prom
         status: 200,
         headers: {
           'Content-Type': resp.headers.get('Content-Type') || 'image/png',
-          'Cache-Control': 'public, max-age=604800', // 7 days
-          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': `public, max-age=${LIMITS.cache.iconTtlSeconds}`, // 7 days
         },
       });
       await cache.put(cacheKey, iconResponse.clone());
@@ -155,7 +158,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   // Handle CORS preflight
   if (method === 'OPTIONS') {
-    return handleCors();
+    return handleCors(request);
   }
 
   // Route matching
@@ -252,7 +255,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         // Keep this aligned with Vaultwarden's reported version to maintain compatibility.
         // When Vaultwarden bumps their version, update this value accordingly.
         // Vaultwarden source: src/api/core/mod.rs → fn config()
-        version: '2025.12.0',
+        version: LIMITS.compatibility.bitwardenServerVersion,
         gitHash: 'nodewarden',
         server: null,
         environment: {
@@ -277,7 +280,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     // Version endpoint (some clients probe this to validate the server)
     if (path === '/api/version' && method === 'GET') {
-      return jsonResponse('2025.12.0');  // Keep in sync with config.version above
+      return jsonResponse(LIMITS.compatibility.bitwardenServerVersion);  // Always same value as /config.version
     }
 
     // Registration endpoint (no auth required, but only works once)
@@ -290,7 +293,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     // If JWT_SECRET is not safely configured, block any other endpoints.
     const secret = (env.JWT_SECRET || '').trim();
-    if (!secret || secret.length < 32 || secret === DEFAULT_DEV_SECRET) {
+    if (!secret || secret.length < LIMITS.auth.jwtSecretMinLength || secret === DEFAULT_DEV_SECRET) {
       return errorResponse('Server configuration error: JWT_SECRET is not set or too weak', 500);
     }
 
@@ -304,12 +307,32 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     const userId = payload.sub;
+    const clientId = getClientIdentifier(request);
+
+    // Dedicated read rate limiting for heavy sync endpoint.
+    if (path === '/api/sync' && method === 'GET') {
+      const rateLimit = new RateLimitService(env.DB);
+      const rateLimitCheck = await rateLimit.consumeSyncReadBudget(userId + ':' + clientId + ':sync');
+
+      if (!rateLimitCheck.allowed) {
+        return new Response(JSON.stringify({
+          error: 'Too many requests',
+          error_description: `Sync rate limit exceeded. Try again in ${rateLimitCheck.retryAfterSeconds} seconds.`,
+        }), {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': rateLimitCheck.retryAfterSeconds!.toString(),
+            'X-RateLimit-Remaining': '0',
+          },
+        });
+      }
+    }
 
     // API rate limiting only for write operations (keep reads frictionless)
     const isWriteMethod = method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH';
     if (isWriteMethod) {
       const rateLimit = new RateLimitService(env.DB);
-      const clientId = getClientIdentifier(request);
       const rateLimitCheck = await rateLimit.consumeApiWriteBudget(userId + ':' + clientId + ':write');
 
       if (!rateLimitCheck.allowed) {

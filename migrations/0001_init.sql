@@ -78,8 +78,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
 
 -- Rate limiting
-CREATE TABLE IF NOT EXISTS login_attempts (
-  email TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS login_attempts_ip (
+  ip TEXT PRIMARY KEY,
   attempts INTEGER NOT NULL,
   locked_until INTEGER,
   updated_at INTEGER NOT NULL
@@ -92,3 +92,8 @@ CREATE TABLE IF NOT EXISTS api_rate_limits (
   PRIMARY KEY (identifier, window_start)
 );
 CREATE INDEX IF NOT EXISTS idx_api_rate_window ON api_rate_limits(window_start);
+
+CREATE TABLE IF NOT EXISTS used_attachment_download_tokens (
+  jti TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);

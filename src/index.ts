@@ -1,11 +1,12 @@
 import { Env } from './types';
 import { handleRequest } from './router';
 import { StorageService } from './services/storage';
+import { applyCors, jsonResponse } from './utils/response';
 
-// Per-isolate flag. Each Worker isolate may have its own copy of this flag,
-// but initializeDatabase() is idempotent (uses CREATE TABLE IF NOT EXISTS),
-// so redundant calls are harmless and fast (single SELECT check).
+// Per-isolate flags. Each Worker isolate may have its own copy of these flags.
+// initializeDatabase() only validates schema presence, so retries are cheap.
 let dbInitialized = false;
+let dbInitError: string | null = null;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -15,12 +16,29 @@ export default {
         const storage = new StorageService(env.DB);
         await storage.initializeDatabase();
         dbInitialized = true;
+        dbInitError = null;
       } catch (error) {
         console.error('Failed to initialize database:', error);
-        // Continue anyway - the error will surface when actual DB operations are attempted
+        dbInitError = error instanceof Error ? error.message : 'Unknown database initialization error';
       }
     }
 
-    return handleRequest(request, env);
+    if (dbInitError) {
+      const resp = jsonResponse(
+        {
+          error: 'Database not initialized',
+          error_description: dbInitError,
+          ErrorModel: {
+            Message: dbInitError,
+            Object: 'error',
+          },
+        },
+        500
+      );
+      return applyCors(request, resp);
+    }
+
+    const resp = await handleRequest(request, env);
+    return applyCors(request, resp);
   },
 };

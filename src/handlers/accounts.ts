@@ -3,12 +3,23 @@ import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
+import { LIMITS } from '../config/limits';
+
+function looksLikeEncString(value: string): boolean {
+  if (!value) return false;
+  const firstDot = value.indexOf('.');
+  if (firstDot <= 0 || firstDot === value.length - 1) return false;
+  const payload = value.slice(firstDot + 1);
+  const parts = payload.split('|');
+  // Bitwarden encrypted payloads should have at least IV + ciphertext.
+  return parts.length >= 2;
+}
 
 function jwtSecretUnsafeReason(env: Env): 'missing' | 'default' | 'too_short' | null {
   const secret = (env.JWT_SECRET || '').trim();
   if (!secret) return 'missing';
   if (secret === DEFAULT_DEV_SECRET) return 'default';
-  if (secret.length < 32) return 'too_short';
+  if (secret.length < LIMITS.auth.jwtSecretMinLength) return 'too_short';
   return null;
 }
 
@@ -63,6 +74,12 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
   if (!privateKey || !publicKey) {
     return errorResponse('Private key and public key are required', 400);
   }
+  if (!looksLikeEncString(key)) {
+    return errorResponse('key is not a valid encrypted string', 400);
+  }
+  if (!looksLikeEncString(privateKey)) {
+    return errorResponse('encryptedPrivateKey is not a valid encrypted string', 400);
+  }
 
   // Create user
   const user: User = {
@@ -74,7 +91,7 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
     privateKey: privateKey,
     publicKey: publicKey,
     kdfType: body.kdf ?? 0,
-    kdfIterations: body.kdfIterations ?? 600000,
+    kdfIterations: body.kdfIterations ?? LIMITS.auth.defaultKdfIterations,
     kdfMemory: body.kdfMemory,
     kdfParallelism: body.kdfParallelism,
     securityStamp: generateUUID(),
@@ -178,6 +195,12 @@ export async function handleSetKeys(request: Request, env: Env, userId: string):
   if (body.key) user.key = body.key;
   if (body.encryptedPrivateKey) user.privateKey = body.encryptedPrivateKey;
   if (body.publicKey) user.publicKey = body.publicKey;
+  if (body.key && !looksLikeEncString(body.key)) {
+    return errorResponse('key is not a valid encrypted string', 400);
+  }
+  if (body.encryptedPrivateKey && !looksLikeEncString(body.encryptedPrivateKey)) {
+    return errorResponse('encryptedPrivateKey is not a valid encrypted string', 400);
+  }
   user.updatedAt = new Date().toISOString();
 
   await storage.saveUser(user);

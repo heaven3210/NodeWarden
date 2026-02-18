@@ -2,6 +2,7 @@ import { Env, Folder, FolderResponse } from '../types';
 import { StorageService } from '../services/storage';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
+import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 
 // Convert internal folder to API response format
 function folderToResponse(folder: Folder): FolderResponse {
@@ -16,12 +17,24 @@ function folderToResponse(folder: Folder): FolderResponse {
 // GET /api/folders
 export async function handleGetFolders(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const folders = await storage.getAllFolders(userId);
+  const url = new URL(request.url);
+  const pagination = parsePagination(url);
+
+  let folders: Folder[];
+  let continuationToken: string | null = null;
+  if (pagination) {
+    const pageRows = await storage.getFoldersPage(userId, pagination.limit + 1, pagination.offset);
+    const hasNext = pageRows.length > pagination.limit;
+    folders = hasNext ? pageRows.slice(0, pagination.limit) : pageRows;
+    continuationToken = hasNext ? encodeContinuationToken(pagination.offset + folders.length) : null;
+  } else {
+    folders = await storage.getAllFolders(userId);
+  }
 
   return jsonResponse({
     data: folders.map(folderToResponse),
     object: 'list',
-    continuationToken: null,
+    continuationToken: continuationToken,
   });
 }
 

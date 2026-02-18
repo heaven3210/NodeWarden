@@ -1,4 +1,5 @@
 import { JWTPayload } from '../types';
+import { LIMITS } from '../config/limits';
 
 // Base64 URL encode
 function base64UrlEncode(data: Uint8Array): string {
@@ -19,7 +20,7 @@ function base64UrlDecode(str: string): Uint8Array {
 }
 
 // Create JWT
-export async function createJWT(payload: Omit<JWTPayload, 'iat' | 'exp' | 'iss' | 'premium' | 'email_verified' | 'amr'>, secret: string, expiresIn: number = 7200): Promise<string> {
+export async function createJWT(payload: Omit<JWTPayload, 'iat' | 'exp' | 'iss' | 'premium' | 'email_verified' | 'amr'>, secret: string, expiresIn: number = LIMITS.auth.accessTokenTtlSeconds): Promise<string> {
   const header = { alg: 'HS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   
@@ -90,7 +91,7 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
 
 // Create refresh token (simple random string)
 export function createRefreshToken(): string {
-  const bytes = new Uint8Array(32);
+  const bytes = new Uint8Array(LIMITS.auth.refreshTokenRandomBytes);
   crypto.getRandomValues(bytes);
   return base64UrlEncode(bytes);
 }
@@ -116,7 +117,7 @@ export async function createFileDownloadToken(
     cipherId,
     attachmentId,
     jti: createRefreshToken(),
-    exp: now + 300, // 5 minutes
+    exp: now + LIMITS.auth.fileDownloadTokenTtlSeconds, // 5 minutes
   };
 
   const encoder = new TextEncoder();

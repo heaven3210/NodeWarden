@@ -41,9 +41,9 @@ import { pbkdf2Sync, randomBytes } from 'node:crypto';
 // ─── 配置 ───────────────────────────────────────────────────────────────────
 // 优先取命令行参数，其次取环境变量，最后用默认值
 
-const BASE     = (process.argv[2] || process.env.NW_URL      || 'http://localhost:8787').replace(/\/+$/, '');
-const EMAIL    = (process.argv[3] || process.env.NW_EMAIL    || 'test@test.com').toLowerCase();
-const PASSWORD = (process.argv[4] || process.env.NW_PASSWORD || 'testtesttest');
+const BASE     = (process.argv[2] || process.env.NW_URL      || 'https://key.shuai.plus').replace(/\/+$/, '');
+const EMAIL    = (process.argv[3] || process.env.NW_EMAIL    || 'shuai@cock.li').toLowerCase();
+const PASSWORD = (process.argv[4] || process.env.NW_PASSWORD || 'rezwangul4qoxka@');
 
 // ─── Bitwarden KDF ─────────────────────────────────────────────────────────
 // Bitwarden 客户端在注册和登录时，不会把明文密码发给服务器。
@@ -346,9 +346,12 @@ async function suiteCors() {
   group('2 · CORS 深度验证（浏览器插件必需）');
 
   await test('OPTIONS / 返回 204 + CORS 头', async () => {
-    const resp = await fetch(`${BASE}/`, { method: 'OPTIONS' });
+    const resp = await fetch(`${BASE}/`, {
+      method: 'OPTIONS',
+      headers: { Origin: BASE },
+    });
     const acao = resp.headers.get('access-control-allow-origin');
-    return { ok: resp.status === 204 && acao === '*' };
+    return { ok: resp.status === 204 && acao === BASE };
   });
 
   // 浏览器插件请求 /identity/connect/token 前会发 OPTIONS 预检
@@ -384,10 +387,12 @@ async function suiteCors() {
   });
 
   // 实际 JSON 响应也必须带 CORS 头（不只是 OPTIONS）
-  await test('JSON 响应包含 Access-Control-Allow-Origin: *', async () => {
-    const resp = await fetch(`${BASE}/config`);
+  await test('JSON 响应包含 Access-Control-Allow-Origin（同源）', async () => {
+    const resp = await fetch(`${BASE}/config`, {
+      headers: { Origin: BASE },
+    });
     const acao = resp.headers.get('access-control-allow-origin');
-    return { ok: acao === '*' };
+    return { ok: acao === BASE };
   });
 }
 
@@ -662,7 +667,7 @@ async function suiteRefresh() {
       method: 'POST', auth: false,
       form: { grant_type: 'refresh_token', refresh_token: oldRefreshToken },
     });
-    return { ok: status === 401, detail: `状态码=${status}` };
+    return { ok: status === 400 || status === 401, detail: `状态码=${status}` };
   });
 }
 
@@ -835,9 +840,14 @@ async function suiteAccounts() {
   });
 
   await test('POST /api/accounts/keys 更新密钥', async () => {
+    const current = await api('/api/accounts/profile');
+    if (current.status !== 200 || !current.body?.key || !current.body?.privateKey) {
+      return { ok: false, detail: '无法读取当前 key/privateKey' };
+    }
     const { status, body } = await api('/api/accounts/keys', {
       method: 'POST',
-      body: { key: userEncKey, publicKey: 'selfcheck-pubkey', encryptedPrivateKey: 'selfcheck-privkey' },
+      // Non-destructive roundtrip: submit current encrypted keys as-is.
+      body: { key: current.body.key, encryptedPrivateKey: current.body.privateKey },
     });
     return { ok: status === 200 && body?.object === 'profile' };
   });

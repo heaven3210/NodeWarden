@@ -1,7 +1,8 @@
 import { Env, DEFAULT_DEV_SECRET } from '../types';
 import { StorageService } from '../services/storage';
-import { jsonResponse, errorResponse } from '../utils/response';
-import { handleRegisterPage } from './setupPage';
+import { jsonResponse, errorResponse, htmlResponse } from '../utils/response';
+import { renderRegisterPageHTML } from '../setup/pageTemplate';
+import { LIMITS } from '../config/limits';
 
 type JwtSecretState = 'missing' | 'default' | 'too_short';
 
@@ -10,8 +11,17 @@ function getJwtSecretState(env: Env): JwtSecretState | null {
   if (!secret) return 'missing';
   // Block common "forgot to change" sample value (matches .dev.vars.example)
   if (secret === DEFAULT_DEV_SECRET) return 'default';
-  if (secret.length < 32) return 'too_short';
+  if (secret.length < LIMITS.auth.jwtSecretMinLength) return 'too_short';
   return null;
+}
+
+async function handleRegisterPage(request: Request, env: Env, jwtState: JwtSecretState | null): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const disabled = await storage.isSetupDisabled();
+  if (disabled) {
+    return new Response(null, { status: 404 });
+  }
+  return htmlResponse(renderRegisterPageHTML(jwtState));
 }
 
 // GET / - Setup page

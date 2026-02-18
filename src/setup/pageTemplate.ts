@@ -1,11 +1,10 @@
-import { Env } from '../types';
-import { StorageService } from '../services/storage';
-import { htmlResponse } from '../utils/response';
+import { LIMITS } from '../config/limits';
 
-type JwtSecretState = 'missing' | 'default' | 'too_short';
+export type JwtSecretState = 'missing' | 'default' | 'too_short';
 
-function renderRegisterPageHTML(jwtState: JwtSecretState | null): string {
+export function renderRegisterPageHTML(jwtState: JwtSecretState | null): string {
   const jwtStateJson = JSON.stringify(jwtState);
+  const defaultKdfIterations = LIMITS.auth.defaultKdfIterations;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1117,7 +1116,7 @@ function renderRegisterPageHTML(jwtState: JwtSecretState | null): string {
       }
 
       try {
-        const iterations = 600000;
+        const iterations = ${defaultKdfIterations};
         const masterKey = await pbkdf2(password, email, iterations, 32);
         const masterPasswordHash = await pbkdf2(masterKey, password, 1, 32);
         const masterPasswordHashB64 = base64Encode(masterPasswordHash);
@@ -1211,13 +1210,4 @@ function renderRegisterPageHTML(jwtState: JwtSecretState | null): string {
   </script>
 </body>
 </html>`;
-}
-
-export async function handleRegisterPage(request: Request, env: Env, jwtState: JwtSecretState | null): Promise<Response> {
-  const storage = new StorageService(env.DB);
-  const disabled = await storage.isSetupDisabled();
-  if (disabled) {
-    return new Response(null, { status: 404 });
-  }
-  return htmlResponse(renderRegisterPageHTML(jwtState));
 }

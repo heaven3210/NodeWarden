@@ -3,6 +3,7 @@ import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
 import { jsonResponse, errorResponse, identityErrorResponse } from '../utils/response';
+import { LIMITS } from '../config/limits';
 
 // POST /identity/connect/token
 export async function handleToken(request: Request, env: Env): Promise<Response> {
@@ -74,7 +75,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
     const response: TokenResponse = {
       access_token: accessToken,
-      expires_in: 7200,
+      expires_in: LIMITS.auth.accessTokenTtlSeconds,
       token_type: 'Bearer',
       refresh_token: refreshToken,
       Key: user.key,
@@ -127,7 +128,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
     const response: TokenResponse = {
       access_token: accessToken,
-      expires_in: 7200,
+      expires_in: LIMITS.auth.accessTokenTtlSeconds,
       token_type: 'Bearer',
       refresh_token: newRefreshToken,
       Key: user.key,
@@ -184,7 +185,7 @@ export async function handlePrelogin(request: Request, env: Env): Promise<Respon
 
   // Return default KDF settings even if user doesn't exist (to prevent user enumeration)
   const kdfType = user?.kdfType ?? 0;
-  const kdfIterations = user?.kdfIterations ?? 600000;
+  const kdfIterations = user?.kdfIterations ?? LIMITS.auth.defaultKdfIterations;
   const kdfMemory = user?.kdfMemory;
   const kdfParallelism = user?.kdfParallelism;
 

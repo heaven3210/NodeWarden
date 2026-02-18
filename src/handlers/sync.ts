@@ -1,7 +1,40 @@
 import { Env, SyncResponse, CipherResponse, FolderResponse, ProfileResponse } from '../types';
 import { StorageService } from '../services/storage';
-import { jsonResponse, errorResponse } from '../utils/response';
+import { errorResponse } from '../utils/response';
 import { cipherToResponse } from './ciphers';
+import { LIMITS } from '../config/limits';
+
+interface SyncCacheEntry {
+  body: string;
+  expiresAt: number;
+}
+
+const syncResponseCache = new Map<string, SyncCacheEntry>();
+
+function buildSyncCacheKey(userId: string, revisionDate: string, excludeDomains: boolean): string {
+  return `${userId}:${revisionDate}:${excludeDomains ? '1' : '0'}`;
+}
+
+function readSyncCache(key: string): string | null {
+  const hit = syncResponseCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    syncResponseCache.delete(key);
+    return null;
+  }
+  return hit.body;
+}
+
+function writeSyncCache(key: string, body: string): void {
+  if (syncResponseCache.size >= LIMITS.cache.syncResponseMaxEntries) {
+    const oldestKey = syncResponseCache.keys().next().value as string | undefined;
+    if (oldestKey) syncResponseCache.delete(oldestKey);
+  }
+  syncResponseCache.set(key, {
+    body,
+    expiresAt: Date.now() + LIMITS.cache.syncResponseTtlMs,
+  });
+}
 
 // GET /api/sync
 export async function handleSync(request: Request, env: Env, userId: string): Promise<Response> {
@@ -13,6 +46,16 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
   const user = await storage.getUserById(userId);
   if (!user) {
     return errorResponse('User not found', 404);
+  }
+
+  const revisionDate = await storage.getRevisionDate(userId);
+  const cacheKey = buildSyncCacheKey(userId, revisionDate, excludeDomains);
+  const cachedBody = readSyncCache(cacheKey);
+  if (cachedBody) {
+    return new Response(cachedBody, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   const ciphers = await storage.getAllCiphers(userId);
@@ -107,5 +150,11 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
     object: 'sync',
   };
 
-  return jsonResponse(syncResponse);
+  const body = JSON.stringify(syncResponse);
+  writeSyncCache(cacheKey, body);
+
+  return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }

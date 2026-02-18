@@ -1,3 +1,5 @@
+import { LIMITS } from '../config/limits';
+
 // D1-backed rate limiting.
 // Notes:
 // - Login attempts are tracked per client IP.
@@ -6,18 +8,59 @@
 // Rate limit configuration
 const CONFIG = {
   // Friendly default: short cooldown instead of long lockouts.
-  LOGIN_MAX_ATTEMPTS: 5,
-  LOGIN_LOCKOUT_MINUTES: 2,
+  LOGIN_MAX_ATTEMPTS: LIMITS.rateLimit.loginMaxAttempts,
+  LOGIN_LOCKOUT_MINUTES: LIMITS.rateLimit.loginLockoutMinutes,
 
   // Write operations only (POST/PUT/DELETE/PATCH) should use this budget.
-  API_WRITE_REQUESTS_PER_MINUTE: 120,
-  API_WINDOW_SECONDS: 60,
+  API_WRITE_REQUESTS_PER_MINUTE: LIMITS.rateLimit.apiWriteRequestsPerMinute,
+  // Dedicated budget for GET /api/sync reads.
+  SYNC_READ_REQUESTS_PER_MINUTE: LIMITS.rateLimit.syncReadRequestsPerMinute,
+  API_WINDOW_SECONDS: LIMITS.rateLimit.apiWindowSeconds,
 };
 
 export class RateLimitService {
   private static loginIpTableReady = false;
+  private static lastLoginIpCleanupAt = 0;
+  private static lastApiWindowCleanupAt = 0;
+
+  private static readonly PERIODIC_CLEANUP_PROBABILITY = LIMITS.rateLimit.cleanupProbability;
+  private static readonly LOGIN_IP_CLEANUP_INTERVAL_MS = LIMITS.rateLimit.loginIpCleanupIntervalMs;
+  private static readonly API_WINDOW_CLEANUP_INTERVAL_MS = LIMITS.rateLimit.apiWindowCleanupIntervalMs;
+  private static readonly LOGIN_IP_RETENTION_MS = LIMITS.rateLimit.loginIpRetentionMs;
+  private static readonly API_WINDOW_RETENTION_WINDOWS = LIMITS.rateLimit.apiWindowRetentionWindows;
 
   constructor(private db: D1Database) {}
+
+  private shouldRunCleanup(lastRunAt: number, intervalMs: number): boolean {
+    const now = Date.now();
+    if (now - lastRunAt < intervalMs) return false;
+    return Math.random() < RateLimitService.PERIODIC_CLEANUP_PROBABILITY;
+  }
+
+  private async maybeCleanupLoginAttemptsIp(nowMs: number): Promise<void> {
+    if (!this.shouldRunCleanup(RateLimitService.lastLoginIpCleanupAt, RateLimitService.LOGIN_IP_CLEANUP_INTERVAL_MS)) {
+      return;
+    }
+
+    const cutoff = nowMs - RateLimitService.LOGIN_IP_RETENTION_MS;
+    await this.db
+      .prepare(
+        'DELETE FROM login_attempts_ip WHERE updated_at < ? AND (locked_until IS NULL OR locked_until < ?)'
+      )
+      .bind(cutoff, nowMs)
+      .run();
+    RateLimitService.lastLoginIpCleanupAt = nowMs;
+  }
+
+  private async maybeCleanupApiWindows(windowStart: number, windowSeconds: number): Promise<void> {
+    if (!this.shouldRunCleanup(RateLimitService.lastApiWindowCleanupAt, RateLimitService.API_WINDOW_CLEANUP_INTERVAL_MS)) {
+      return;
+    }
+
+    const cutoff = windowStart - (windowSeconds * RateLimitService.API_WINDOW_RETENTION_WINDOWS);
+    await this.db.prepare('DELETE FROM api_rate_limits WHERE window_start < ?').bind(cutoff).run();
+    RateLimitService.lastApiWindowCleanupAt = Date.now();
+  }
 
   private async ensureLoginIpTable(): Promise<void> {
     if (RateLimitService.loginIpTableReady) return;
@@ -45,6 +88,7 @@ export class RateLimitService {
 
     const key = ip.trim() || 'unknown';
     const now = Date.now();
+    await this.maybeCleanupLoginAttemptsIp(now);
 
     const row = await this.db
       .prepare('SELECT attempts, locked_until FROM login_attempts_ip WHERE ip = ?')
@@ -77,10 +121,11 @@ export class RateLimitService {
 
     const key = ip.trim() || 'unknown';
     const now = Date.now();
+    await this.maybeCleanupLoginAttemptsIp(now);
 
     // D1 in Workers forbids raw BEGIN/COMMIT statements.
     // Use a single atomic UPSERT to increment attempts.
-    // This is concurrency-safe because the row is keyed by email.
+    // This is concurrency-safe because the row is keyed by IP.
     await this.db
       .prepare(
         'INSERT INTO login_attempts_ip(ip, attempts, locked_until, updated_at) VALUES(?, 1, NULL, ?) ' +
@@ -113,26 +158,30 @@ export class RateLimitService {
     await this.db.prepare('DELETE FROM login_attempts_ip WHERE ip = ?').bind(key).run();
   }
 
-  // Atomically consume one write budget unit for the current fixed window.
+  // Atomically consume one budget unit for the current fixed window.
   // Uses SQLite UPSERT-with-WHERE so requests at/over limit do not increment.
-  async consumeApiWriteBudget(identifier: string): Promise<{ allowed: boolean; remaining: number; retryAfterSeconds?: number }> {
+  private async consumeFixedWindowBudget(
+    identifier: string,
+    maxRequests: number,
+    windowSeconds: number
+  ): Promise<{ allowed: boolean; remaining: number; retryAfterSeconds?: number }> {
     const nowSec = Math.floor(Date.now() / 1000);
-    const windowStart = nowSec - (nowSec % CONFIG.API_WINDOW_SECONDS);
-    const windowEnd = windowStart + CONFIG.API_WINDOW_SECONDS;
+    const windowStart = nowSec - (nowSec % windowSeconds);
+    const windowEnd = windowStart + windowSeconds;
+    await this.maybeCleanupApiWindows(windowStart, windowSeconds);
 
-    const row = await this.db
+    const writeResult = await this.db
       .prepare(
         'INSERT INTO api_rate_limits(identifier, window_start, count) VALUES(?, ?, 1) ' +
         'ON CONFLICT(identifier, window_start) DO UPDATE SET count = count + 1 ' +
-        'WHERE api_rate_limits.count < ? ' +
-        'RETURNING count'
+        'WHERE api_rate_limits.count < ?'
       )
-      .bind(identifier, windowStart, CONFIG.API_WRITE_REQUESTS_PER_MINUTE)
-      .first<{ count: number }>();
+      .bind(identifier, windowStart, maxRequests)
+      .run();
 
-    // No returned row means conflict happened and WHERE prevented the increment:
-    // current count is already at/above the configured limit.
-    if (!row) {
+    // No changed row means conflict happened and WHERE prevented increment:
+    // current count is already at/above configured limit.
+    if ((writeResult.meta.changes ?? 0) === 0) {
       return {
         allowed: false,
         remaining: 0,
@@ -140,8 +189,38 @@ export class RateLimitService {
       };
     }
 
-    const remaining = Math.max(0, CONFIG.API_WRITE_REQUESTS_PER_MINUTE - row.count);
+    const row = await this.db
+      .prepare('SELECT count FROM api_rate_limits WHERE identifier = ? AND window_start = ?')
+      .bind(identifier, windowStart)
+      .first<{ count: number }>();
+
+    if (!row) {
+      return {
+        allowed: true,
+        remaining: 0,
+      };
+    }
+
+    const remaining = Math.max(0, maxRequests - row.count);
     return { allowed: true, remaining };
+  }
+
+  // Write budget for POST/PUT/DELETE/PATCH requests.
+  async consumeApiWriteBudget(identifier: string): Promise<{ allowed: boolean; remaining: number; retryAfterSeconds?: number }> {
+    return this.consumeFixedWindowBudget(
+      identifier,
+      CONFIG.API_WRITE_REQUESTS_PER_MINUTE,
+      CONFIG.API_WINDOW_SECONDS
+    );
+  }
+
+  // Read budget for GET /api/sync.
+  async consumeSyncReadBudget(identifier: string): Promise<{ allowed: boolean; remaining: number; retryAfterSeconds?: number }> {
+    return this.consumeFixedWindowBudget(
+      identifier,
+      CONFIG.SYNC_READ_REQUESTS_PER_MINUTE,
+      CONFIG.API_WINDOW_SECONDS
+    );
   }
 }
 
